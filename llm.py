@@ -1,4 +1,10 @@
-"""Claude API wrapper — turns collected pod context into an RCA."""
+"""Claude API wrapper — turns collected pod context into an RCA.
+
+Output is deliberately structured so it stays useful even when the hypothesis
+is wrong: observations are transcription (near-always correct), the hypothesis
+ships with a one-command falsification test, and alternatives keep a bad guess
+from dead-ending triage.
+"""
 
 from __future__ import annotations
 
@@ -27,7 +33,7 @@ class RCAResult:
 
 class LLM:
     def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
-        # Override with `export ANTHROPIC_MODEL=claude-sonnet-5` if you want newer
+        # Override with `export ANTHROPIC_MODEL=...` if you want a different model
         self.model = model or os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
         self.client = Anthropic(api_key=api_key)  # reads ANTHROPIC_API_KEY from env
 
@@ -44,7 +50,8 @@ class LLM:
         try:
             resp = self.client.messages.create(
                 model=self.model,
-                max_tokens=1024,
+                max_tokens=1200,
+                temperature=0,   # reduce run-to-run variance on identical input
                 system=_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -61,27 +68,43 @@ class LLM:
         )
 
 
-_SYSTEM_PROMPT = """You are a senior Site Reliability Engineer diagnosing Kubernetes issues.
+_SYSTEM_PROMPT = """You are a senior Site Reliability Engineer triaging a Kubernetes alert.
 
-Given a firing alert plus the pod's status, events, and log tails, produce a concise
-root-cause analysis and remediation plan.
+Your output is a FIRST-PASS triage aid for an on-call engineer, not a verdict.
+It must stay useful even if your leading hypothesis turns out to be wrong.
+
+Evidence priority:
+- Kubernetes events are the primary evidence for WHY a container was killed or
+  failed to start. Weigh them above log contents.
+- Distinguish cause from effect. A container killed by a failing liveness probe,
+  an OOM kill, or a node eviction often logs a clean, graceful shutdown.
+  A graceful exit (SIGTERM/SIGQUIT, exit code 0) is NOT evidence the application
+  failed on its own — look to the events for an external cause first.
+- If an event shows a probe failing against a port, treat the port the app
+  actually binds to as unverified until checked — do not assume either way.
 
 Rules:
-- Be specific — point to exact events, log lines, or numeric evidence.
-- If the signal is ambiguous, say so; do not invent details.
+- Every claim must trace to a specific event, log line, or number in the input.
+- Never invent details. If the evidence is thin, say so and lower your confidence.
 - Assume the reader can run kubectl and edit manifests.
-- Keep the whole response under ~300 words.
+- Keep the whole response under ~350 words.
 
-Format as Slack-flavored markdown, exactly these three sections:
+Format as Slack-flavored markdown, exactly these four sections:
 
-*Root cause*
-1-3 sentences naming the specific failure and the evidence pointing to it.
+*Observations*
+3-5 bullets of raw facts only — no interpretation. Quote counts, exit codes,
+event reasons, and timestamps as given. This section must be verifiable line by line.
 
-*Suggested fix*
-Numbered list of concrete steps. Include kubectl commands or manifest changes where relevant.
+*Most likely cause*
+1-3 sentences. Name the specific failure and cite the exact evidence for it.
 
-*Confidence*
-High / Medium / Low — with one sentence why.
+*Confirm it*
+The single best command to prove or disprove the hypothesis above, and what
+result would confirm vs. refute it. Then the fix to apply if confirmed.
+
+*If that's not it*
+1-2 alternative hypotheses ranked by likelihood, each with the one check that
+would test it. This section is mandatory — never omit it, even at high confidence.
 """
 
 
@@ -117,22 +140,32 @@ def _build_prompt(
         if c.message:
             p.append(f"  message: {c.message}")
 
+    # Events come BEFORE logs: kubelet's account of *why* a container was
+    # killed is usually the root cause, while logs often show only the *effect*
+    # (e.g. a graceful shutdown that looks like a self-inflicted exit).
     if ctx.events:
-        p.append("\n# Events (newest first)")
+        p.append("\n# Kubernetes events (newest first) — PRIMARY EVIDENCE")
         for e in ctx.events[:MAX_EVENTS]:
             p.append(
                 f"- [{e['type']}/{e['reason']}] ×{e['count']} at {e['time']}: {e['message']}"
             )
 
+    p.append(
+        "\n# Log tails — SUPPORTING EVIDENCE ONLY\n"
+        "Note: a container terminated by a failing probe, an OOM kill, or an "
+        "eviction logs a normal graceful shutdown. Read such logs as the *effect* "
+        "of an external kill, not proof the app exited on its own."
+    )
+
     if ctx.previous_logs:
-        p.append("\n# Previous-run log tails (before last restart — usually the smoking gun)")
+        p.append("\n## Previous run (before last restart)")
         for name, txt in ctx.previous_logs.items():
-            p.append(f"## {name}\n```\n{_tail(txt, MAX_LOG_LINES_PER_CONTAINER)}\n```")
+            p.append(f"### {name}\n```\n{_tail(txt, MAX_LOG_LINES_PER_CONTAINER)}\n```")
 
     if ctx.logs:
-        p.append("\n# Current log tails")
+        p.append("\n## Current run")
         for name, txt in ctx.logs.items():
-            p.append(f"## {name}\n```\n{_tail(txt, MAX_LOG_LINES_PER_CONTAINER)}\n```")
+            p.append(f"### {name}\n```\n{_tail(txt, MAX_LOG_LINES_PER_CONTAINER)}\n```")
 
     if ctx.errors:
         p.append(f"\n# Collector warnings\n{'; '.join(ctx.errors)}")
