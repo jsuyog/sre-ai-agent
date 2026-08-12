@@ -22,22 +22,26 @@ class ContainerState:
     ready: bool
     restart_count: int
     state: str                    # "running" | "waiting" | "terminated"
-    reason: str | None = None     # e.g. "CrashLoopBackOff", "OOMKilled"
+    reason: str | None = None     # current-state reason, e.g. "CrashLoopBackOff"
     message: str | None = None
     exit_code: int | None = None
+    # Previous termination — where OOMKilled / Error / exit codes actually live.
+    last_reason: str | None = None      # e.g. "OOMKilled", "Error"
+    last_exit_code: int | None = None
+    last_signal: int | None = None
 
 
 @dataclass
 class PodContext:
     namespace: str
     pod: str
-    phase: str                    # Pending | Running | Succeeded | Failed | Unknown
+    phase: str
     node: str | None
     containers: list[ContainerState] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
-    logs: dict[str, str] = field(default_factory=dict)          # container -> current logs
-    previous_logs: dict[str, str] = field(default_factory=dict)  # container -> logs from last run
-    errors: list[str] = field(default_factory=list)              # non-fatal collection errors
+    logs: dict[str, str] = field(default_factory=dict)
+    previous_logs: dict[str, str] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -50,7 +54,7 @@ class Collector:
     and the in-cluster ServiceAccount when running inside.
     """
 
-    LOG_TAIL_LINES = 200  # per container per run
+    LOG_TAIL_LINES = 200
 
     def __init__(self) -> None:
         try:
@@ -59,21 +63,14 @@ class Collector:
         except config.ConfigException:
             config.load_kube_config()
             log.info("Loaded local kubeconfig")
-
         self.core = client.CoreV1Api()
-
-    # ---- public API ----
 
     def collect(self, namespace: str, pod: str) -> PodContext:
         ctx = PodContext(namespace=namespace, pod=pod, phase="Unknown", node=None)
-
         self._fill_pod_status(ctx)
         self._fill_events(ctx)
         self._fill_logs(ctx)
-
         return ctx
-
-    # ---- internals ----
 
     def _fill_pod_status(self, ctx: PodContext) -> None:
         try:
@@ -100,6 +97,14 @@ class Collector:
                 message = st.terminated.message
                 exit_code = st.terminated.exit_code
 
+            # Previous termination — the real home of OOMKilled/exit codes.
+            last_reason = last_exit_code = last_signal = None
+            last = cs.last_state
+            if last and last.terminated:
+                last_reason = last.terminated.reason
+                last_exit_code = last.terminated.exit_code
+                last_signal = last.terminated.signal
+
             ctx.containers.append(
                 ContainerState(
                     name=cs.name,
@@ -109,12 +114,13 @@ class Collector:
                     reason=reason,
                     message=message,
                     exit_code=exit_code,
+                    last_reason=last_reason,
+                    last_exit_code=last_exit_code,
+                    last_signal=last_signal,
                 )
             )
 
     def _fill_events(self, ctx: PodContext) -> None:
-        """Events tell us what the scheduler/kubelet has been doing to this pod:
-        image pulls, container kills, back-off restarts. Often the smoking gun."""
         try:
             selector = f"involvedObject.name={ctx.pod}"
             evs = self.core.list_namespaced_event(
@@ -124,7 +130,6 @@ class Collector:
             ctx.errors.append(f"list_events failed: {e.status} {e.reason}")
             return
 
-        # Newest first, cap to avoid flooding the prompt.
         items = sorted(
             evs.items,
             key=lambda e: e.last_timestamp or e.event_time or e.metadata.creation_timestamp,
@@ -135,16 +140,13 @@ class Collector:
             ts = e.last_timestamp or e.event_time or e.metadata.creation_timestamp
             ctx.events.append({
                 "time": ts.isoformat() if ts else None,
-                "type": e.type,             # Normal | Warning
-                "reason": e.reason,          # BackOff, Failed, Pulled, ...
+                "type": e.type,
+                "reason": e.reason,
                 "message": e.message,
                 "count": e.count,
             })
 
     def _fill_logs(self, ctx: PodContext) -> None:
-        """Fetch logs for each container. For crashlooping containers the *previous*
-        run's logs usually contain the real error — the current run may have never
-        actually started."""
         for c in ctx.containers:
             self._safe_logs(ctx, c.name, previous=False)
             if c.restart_count > 0:
@@ -159,9 +161,9 @@ class Collector:
                 container=container,
                 previous=previous,
                 tail_lines=self.LOG_TAIL_LINES,
-                _preload_content=False,   # get the raw HTTPResponse
+                _preload_content=False,
             )
-            data = raw.data  # bytes
+            data = raw.data
             text = data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
             target[container] = text or "(empty)"
         except ApiException as e:
@@ -173,17 +175,14 @@ class Collector:
             )
 
 
-# ---- CLI for manual testing ----
 if __name__ == "__main__":
     import json
     import sys
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-
     if len(sys.argv) != 3:
         print("Usage: python collector.py <namespace> <pod>", file=sys.stderr)
         sys.exit(2)
-
     ns, pod = sys.argv[1], sys.argv[2]
     ctx = Collector().collect(ns, pod)
     print(json.dumps(ctx.to_dict(), indent=2, default=str))
