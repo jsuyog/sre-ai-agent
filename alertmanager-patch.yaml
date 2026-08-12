@@ -1,0 +1,18 @@
+alertmanager:
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: sre-agent
+      group_by: ['namespace', 'alertname', 'container', 'reason']
+      group_wait: 10s
+      group_interval: 30s
+      repeat_interval: 10m
+      routes:
+        # Send everything to the agent by default
+        - receiver: sre-agent
+    receivers:
+      - name: sre-agent
+        webhook_configs:
+          - url: 'http://host.minikube.internal:8080/alert'
+            send_resolved: true    # so resolutions reach the agent too
