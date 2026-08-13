@@ -76,6 +76,9 @@ It must stay useful even if your leading hypothesis turns out to be wrong.
 Evidence priority:
 - Kubernetes events are the primary evidence for WHY a container was killed or
   failed to start. Weigh them above log contents.
+- A container's LAST termination reason (e.g. OOMKilled, exit 137) is decisive
+  and often the only place a crash cause appears — Kubernetes emits no event for
+  OOM kills. Always check it before blaming the application code.
 - Distinguish cause from effect. A container killed by a failing liveness probe,
   an OOM kill, or a node eviction often logs a clean, graceful shutdown.
   A graceful exit (SIGTERM/SIGQUIT, exit code 0) is NOT evidence the application
@@ -136,6 +139,10 @@ def _build_prompt(
         if c.exit_code is not None:
             line += f", exit_code={c.exit_code}"
         line += f", restarts={c.restart_count}"
+        if c.last_reason:
+            line += f", last_termination={c.last_reason}"
+            if c.last_exit_code is not None:
+                line += f" (exit {c.last_exit_code})"
         p.append(line)
         if c.message:
             p.append(f"  message: {c.message}")
@@ -177,21 +184,17 @@ def _tail(text: str, n_lines: int) -> str:
     return "\n".join(text.strip().splitlines()[-n_lines:])
 
 
-# ---- CLI for manual testing: python llm.py <namespace> <pod> ----
 if __name__ == "__main__":
     import sys
     from collector import Collector
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-
     if len(sys.argv) != 3:
         print("Usage: python llm.py <namespace> <pod>", file=sys.stderr)
         sys.exit(2)
-
     ns, pod = sys.argv[1], sys.argv[2]
     ctx = Collector().collect(ns, pod)
     result = LLM().analyze(alertname="ManualTest", ctx=ctx)
-
     print("=" * 60)
     print(result.text)
     print("=" * 60)
